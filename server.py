@@ -234,17 +234,31 @@ def send_message(d: MsgIn, u=Depends(current_user)):
 
 
 @app.get("/messages/{username}")
-def get_messages(username: str, u=Depends(current_user)):
-    with engine.begin() as c:
-        f = user_by_name(c, username)
-        if not f:
-            raise HTTPException(404, "Kullanıcı yok.")
-        rows = c.execute(select(messages).where(or_(
-            and_(messages.c.sender_id == u["id"], messages.c.receiver_id == f["id"]),
-            and_(messages.c.sender_id == f["id"], messages.c.receiver_id == u["id"])))
-            .order_by(desc(messages.c.id)).limit(50)).mappings().all()
-    return [{"from": u["username"] if r["sender_id"] == u["id"] else f["username"],
-             "text": r["body"], "ts": r["ts"].strftime("%d.%m %H:%M")} for r in reversed(rows)]
+def get_messages(username: str, after: Optional[int] = None, wait: int = 0, u=Depends(current_user)):
+    """after verilmezse son 50 mesaj. after verilirse o id'den yeni mesajlar;
+    yeni mesaj yoksa 'wait' saniyeye kadar bekler (anlık mesajlaşma için)."""
+    wait = max(0, min(wait, 25))
+    deadline = time.time() + wait
+    while True:
+        with engine.begin() as c:
+            f = user_by_name(c, username)
+            if not f:
+                raise HTTPException(404, "Kullanıcı yok.")
+            pair = or_(
+                and_(messages.c.sender_id == u["id"], messages.c.receiver_id == f["id"]),
+                and_(messages.c.sender_id == f["id"], messages.c.receiver_id == u["id"]))
+            if after is None:
+                rows = list(reversed(c.execute(select(messages).where(pair)
+                            .order_by(desc(messages.c.id)).limit(50)).mappings().all()))
+            else:
+                rows = c.execute(select(messages).where(and_(pair, messages.c.id > after))
+                                 .order_by(messages.c.id).limit(100)).mappings().all()
+        if rows or after is None or time.time() >= deadline:
+            break
+        time.sleep(0.5)
+    return [{"id": r["id"],
+             "from": u["username"] if r["sender_id"] == u["id"] else f["username"],
+             "text": r["body"], "ts": r["ts"].strftime("%d.%m %H:%M")} for r in rows]
 
 
 @app.get("/news")
