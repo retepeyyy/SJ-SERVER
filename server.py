@@ -2,11 +2,11 @@
 Render'da çalıştır:  uvicorn server:app --host 0.0.0.0 --port $PORT
 Ortam değişkenleri: DATABASE_URL (Render PostgreSQL), ADMIN_KEY (sadece sende olan gizli anahtar)
 """
-import os, re, hmac, hashlib, secrets, time
+import os, re, hmac, hashlib, secrets, time, asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request, Depends
+from fastapi import FastAPI, HTTPException, Header, Request, Depends, WebSocket
 from pydantic import BaseModel
 from sqlalchemy import (create_engine, MetaData, Table, Column, Integer, String, Text,
                         DateTime, select, insert, update, delete, and_, or_, desc)
@@ -61,6 +61,13 @@ logs = Table("logs", md,
     Column("actor", String(32)),
     Column("action", String(40)),
     Column("detail", Text))
+events = Table("events", md,
+    Column("id", Integer, primary_key=True),
+    Column("kind", String(12), nullable=False),
+    Column("text", Text, nullable=False),
+    Column("target_id", Integer),          # None = herkese
+    Column("data", String(32)),
+    Column("ts", DateTime, default=now))
 md.create_all(engine)
 
 app = FastAPI(title="SJ Yönetim Konsolları")
@@ -73,6 +80,10 @@ def hash_pw(pw: str, salt: str) -> str:
 
 def log(conn, actor, action, detail=""):
     conn.execute(insert(logs).values(actor=actor, action=action, detail=detail))
+
+
+def add_event(conn, kind, text_, target_id=None, data=None):
+    conn.execute(insert(events).values(kind=kind, text=text_, target_id=target_id, data=data))
 
 
 def client_ip(req: Request) -> str:
@@ -209,6 +220,7 @@ def add_friend(d: FriendIn, u=Depends(current_user)):
         c.execute(insert(friends).values(user_id=u["id"], friend_id=f["id"]))
         c.execute(insert(friends).values(user_id=f["id"], friend_id=u["id"]))
         log(c, u["username"], "arkadas_ekle", f["username"])
+        add_event(c, "friend", f"{u['username']} seni arkadaş olarak ekledi", f["id"])
     return {"ok": True, "username": f["username"]}
 
 
@@ -230,6 +242,7 @@ def send_message(d: MsgIn, u=Depends(current_user)):
         if not f or not c.execute(select(friends).where(and_(friends.c.user_id == u["id"], friends.c.friend_id == f["id"]))).first():
             raise HTTPException(403, "Sadece arkadaşlarına mesaj atabilirsin.")
         c.execute(insert(messages).values(sender_id=u["id"], receiver_id=f["id"], body=text_))
+        add_event(c, "msg", f"{u['username']} sana mesaj attı", f["id"], u["username"])
     return {"ok": True}
 
 
@@ -275,6 +288,7 @@ def post_news(d: NewsIn, u=Depends(staff)):
     with engine.begin() as c:
         c.execute(insert(news).values(title=d.title[:120], body=d.body[:4000], author=u["username"]))
         log(c, u["username"], "haber_yayin", d.title[:60])
+        add_event(c, "news", f"HABER ({u['username']}): {d.title[:60]} - {d.body[:120]}")
     return {"ok": True}
 
 
@@ -304,4 +318,111 @@ def set_role(d: RoleIn, u=Depends(admin_only)):
             raise HTTPException(403, "Adminin rolü değiştirilemez.")
         c.execute(update(users).where(users.c.id == t["id"]).values(role=d.role))
         log(c, u["username"], "rol_degis", f"{d.username} -> {d.role}")
+        add_event(c, "role", f"Rolün değişti: {d.role}", t["id"], d.role)
     return {"ok": True}
+
+
+@app.get("/events")
+def get_events(after: Optional[int] = None, wait: int = 0, u=Depends(current_user)):
+    """Anlık bildirimler. after verilmezse sadece son id döner (eski olaylar gösterilmez).
+    after verilirse yeni olay gelene kadar 'wait' saniyeye kadar bekler."""
+    wait = max(0, min(wait, 25))
+    deadline = time.time() + wait
+    while True:
+        with engine.begin() as c:
+            if after is None:
+                last = c.execute(select(events.c.id).order_by(desc(events.c.id)).limit(1)).scalar() or 0
+                return {"last": last, "events": []}
+            rows = c.execute(select(events).where(and_(
+                events.c.id > after,
+                or_(events.c.target_id.is_(None), events.c.target_id == u["id"])))
+                .order_by(events.c.id).limit(50)).mappings().all()
+        if rows or time.time() >= deadline:
+            break
+        time.sleep(0.5)
+    return {"last": rows[-1]["id"] if rows else after,
+            "events": [{"id": r["id"], "kind": r["kind"], "text": r["text"], "data": r["data"]} for r in rows]}
+
+
+# ---------- canlı sesli konuşma ----------
+class CallIn(BaseModel):
+    to: str
+
+
+@app.post("/call/invite")
+def call_invite(d: CallIn, u=Depends(current_user)):
+    with engine.begin() as c:
+        f = user_by_name(c, d.to)
+        if not f or not c.execute(select(friends).where(and_(friends.c.user_id == u["id"], friends.c.friend_id == f["id"]))).first():
+            raise HTTPException(403, "Sadece arkadaşlarını arayabilirsin.")
+        add_event(c, "call", f"{u['username']} seni sesli arıyor! Ana menüde 5'e bas (sohbetteysen /kabul yaz).", f["id"], u["username"])
+        log(c, u["username"], "sesli_arama", f["username"])
+    return {"ok": True}
+
+
+rooms = {}  # {"ali|veli": {"ali": ws, "veli": ws}}  - ses sadece aktarılır, kaydedilmez
+
+
+def ws_auth(token, other):
+    with engine.begin() as c:
+        me = c.execute(select(users).join(tokens, tokens.c.user_id == users.c.id)
+                       .where(tokens.c.token == token)).mappings().first()
+        if not me:
+            return None
+        f = user_by_name(c, other)
+        if not f or not c.execute(select(friends).where(and_(friends.c.user_id == me["id"], friends.c.friend_id == f["id"]))).first():
+            return None
+        return me["username"]
+
+
+@app.websocket("/ws/call/{other}")
+async def call_ws(ws: WebSocket, other: str):
+    await ws.accept()
+    try:
+        token = await asyncio.wait_for(ws.receive_text(), timeout=10)
+    except Exception:
+        await ws.close()
+        return
+    me = ws_auth(token, other)
+    if not me:
+        await ws.close(code=4401)
+        return
+    key = "|".join(sorted([me, other]))
+    room = rooms.setdefault(key, {})
+    old = room.get(me)
+    if old:
+        try:
+            await old.close()
+        except Exception:
+            pass
+    room[me] = ws
+    await ws.send_text("ok")
+    peer = room.get(other)
+    if peer:
+        for w in (ws, peer):
+            try:
+                await w.send_text("peer")
+            except Exception:
+                pass
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            p = room.get(other)
+            if p:
+                try:
+                    await p.send_bytes(data)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        if room.get(me) is ws:
+            room.pop(me, None)
+        p = room.get(other)
+        if p:
+            try:
+                await p.close()
+            except Exception:
+                pass
+        if not room:
+            rooms.pop(key, None)
